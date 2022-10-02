@@ -1,17 +1,39 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 from abc import abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 from types import TracebackType
-from typing import Awaitable, Callable, ParamSpec, Type, TypeVar, overload
+from typing import (
+    TYPE_CHECKING,
+    Awaitable,
+    Callable,
+    ClassVar,
+    ParamSpec,
+    Type,
+    TypeVar,
+    overload,
+)
 
 from disjuntor.storage import MemoryStorage, Storage
 
+if TYPE_CHECKING:
+    import rich.repr
+
 P = ParamSpec("P")
 T = TypeVar("T")
+
+
+def _is_async_callable(obj: object) -> bool:
+    while isinstance(obj, functools.partial):
+        obj = obj.func
+
+    return asyncio.iscoroutinefunction(obj) or (
+        callable(obj) and asyncio.iscoroutinefunction(obj.__call__)
+    )
 
 
 class State(str, Enum):
@@ -24,8 +46,9 @@ class CircuitBreakerException(Exception):
     ...
 
 
+@dataclass(eq=False)
 class BaseState:
-    state: State
+    state: ClassVar[State]
     name: str
     storage: Storage
     timeout: timedelta
@@ -35,28 +58,22 @@ class BaseState:
         cls.state = state
         return super().__init_subclass__()
 
-    def __init__(
-        self, name: str, storage: Storage, timeout: timedelta, threshold: int
-    ) -> None:
-        raise NotImplementedError()
-
     def next_state(self) -> BaseState:
         raise NotImplementedError()
 
-    def success(self) -> None:
+    def success(self) -> BaseState:
         raise NotImplementedError()
 
-    @abstractmethod
-    def failure(self) -> None:
+    def failure(self) -> BaseState:
         raise NotImplementedError()
 
     def is_open(self) -> bool:
         return self.state == State.OPEN
 
-    def __repr__(self) -> str:
+    def __repr__(self) -> str:  # pragma: no cover
         return f"{self.__class__.__name__}(timeout={self.timeout}, threshold={self.threshold})"
 
-    def __rich_repr__(self):
+    def __rich_repr__(self) -> rich.repr.Result:  # pragma: no cover
         yield self.__class__.__name__
         yield "name", self.name
         yield "storage", self.storage
@@ -69,19 +86,14 @@ class BaseState:
         return False
 
 
+@dataclass(eq=False)
 class OpenState(BaseState, state=State.OPEN):
-    def __init__(
-        self, name: str, storage: Storage, timeout: timedelta, threshold: int
-    ) -> None:
-        self.name = name
-        self.storage = storage
-        self.timeout = timeout
-        self.threshold = threshold
-        self.storage.start_timeout_timer(name)
+    def __post_init__(self) -> None:
+        self.storage.start_timeout_timer(self.name)
 
     def next_state(self) -> BaseState:
         timer = self.storage.timer(self.name)
-        if timer and timer - datetime.now() > self.timeout:
+        if timer and timer + self.timeout > datetime.now():
             return self
         return HalfOpenState(
             name=self.name,
@@ -90,24 +102,15 @@ class OpenState(BaseState, state=State.OPEN):
             threshold=self.threshold,
         )
 
-    def success(self) -> None:
-        ...
+    def success(self) -> BaseState:
+        return self
 
-    def failure(self) -> None:
-        ...
+    def failure(self) -> BaseState:
+        return self
 
 
+@dataclass(eq=False)
 class ClosedState(BaseState, state=State.CLOSED):
-    _failure_counter: int
-
-    def __init__(
-        self, name: str, storage: Storage, timeout: timedelta, threshold: int
-    ) -> None:
-        self.name = name
-        self.storage = storage
-        self.timeout = timeout
-        self.threshold = threshold
-
     def next_state(self) -> BaseState:
         failure_counter = self.storage.failure_counter(self.name)
         if failure_counter >= self.threshold:
@@ -119,22 +122,16 @@ class ClosedState(BaseState, state=State.CLOSED):
             )
         return self
 
-    def success(self) -> None:
-        ...
+    def success(self) -> BaseState:
+        return self
 
-    def failure(self) -> None:
+    def failure(self) -> BaseState:
         self.storage.increment_failure_counter(self.name)
+        return self.next_state()
 
 
+@dataclass(eq=False)
 class HalfOpenState(BaseState, state=State.HALF_OPEN):
-    def __init__(
-        self, name: str, storage: Storage, timeout: timedelta, threshold: int
-    ) -> None:
-        self.name = name
-        self.storage = storage
-        self.timeout = timeout
-        self.threshold = threshold
-
     def next_state(self) -> BaseState:
         if self.storage.success_counter(self.name) >= self.threshold:
             return ClosedState(
@@ -145,11 +142,12 @@ class HalfOpenState(BaseState, state=State.HALF_OPEN):
             )
         return self
 
-    def success(self) -> None:
+    def success(self) -> BaseState:
         self.storage.increment_success_counter(self.name)
+        return self.next_state()
 
-    def failure(self) -> None:
-        self = OpenState(
+    def failure(self) -> BaseState:
+        return OpenState(
             name=self.name,
             storage=self.storage,
             timeout=self.timeout,
@@ -163,6 +161,7 @@ def _get_state(
     for cls in BaseState.__subclasses__():
         if cls.state == state:
             return cls(name=name, storage=storage, timeout=timeout, threshold=threshold)
+    raise RuntimeError(f"State {state} not found.")
 
 
 class CircuitBreaker:
@@ -176,6 +175,7 @@ class CircuitBreaker:
         timeout: timedelta = timedelta(seconds=60),
     ) -> None:
         self.storage = storage
+        self.name = name
         self.state = _get_state(
             name=name,
             state=state,
@@ -199,14 +199,14 @@ class CircuitBreaker:
         if self.state.is_open():
             raise CircuitBreakerException()
 
-        if asyncio.iscoroutine(func):
+        if _is_async_callable(func):
 
             async def async_decorator(*args: P.args, **kwargs: P.kwargs) -> T:
                 try:
                     result = await func(*args, **kwargs)
-                    self.state.success()
+                    self.state = self.state.success()
                 except Exception:
-                    self.state.failure()
+                    self.state = self.state.failure()
                     raise
                 return result
 
@@ -216,15 +216,15 @@ class CircuitBreaker:
             def decorator(*args: P.args, **kwargs: P.kwargs) -> T:
                 try:
                     result = func(*args, **kwargs)
-                    self.state.success()
+                    self.state = self.state.success()
                 except Exception:
-                    self.state.failure()
+                    self.state = self.state.failure()
                     raise
                 return result
 
             return decorator
 
-    def __enter__(self):
+    def __enter__(self) -> CircuitBreaker:
         self.state = self.state.next_state()
         if self.state.is_open():
             raise CircuitBreakerException()
@@ -235,13 +235,13 @@ class CircuitBreaker:
         exc_type: Type[BaseException] | None,
         exc: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool | None:
+    ) -> None:
         if exc is None:
-            self.state.success()
+            self.state = self.state.success()
         else:
-            self.state.failure()
+            self.state = self.state.failure()
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> CircuitBreaker:
         self.state = self.state.next_state()
         if self.state.is_open():
             raise CircuitBreakerException()
@@ -252,11 +252,11 @@ class CircuitBreaker:
         exc_type: Type[BaseException] | None,
         exc: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool | None:
+    ) -> None:
         if exc is None:
-            self.state.success()
+            self.state = self.state.success()
         else:
-            self.state.failure()
+            self.state = self.state.failure()
 
 
 @dataclass
@@ -276,7 +276,7 @@ class CircuitBreakerFactory:
         )
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     from rich.console import Console
 
     cb_factory = CircuitBreakerFactory()
